@@ -1,0 +1,21 @@
+app = "stablescan-bot"
+primary_region = "lax"
+
+[build]
+  [build.args]
+    NODE_VERSION = "18"
+
+[env]
+  NODE_ENV = "production"
+  PAPER_MODE = "true"
+  POSITION_SIZE = "100"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  [services.concurrency]
+    hard_limit = 1
+    soft_limit = 1
+
+[processes]
+  app = "node bot.js"

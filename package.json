@@ -1,0 +1,15 @@
+{
+  "name": "stablescan-bot",
+  "version": "1.0.0",
+  "description": "Binance stable-crypto trend-following bot — BTC/ETH/SOL",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}

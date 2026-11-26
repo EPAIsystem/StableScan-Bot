@@ -28,11 +28,25 @@ const RSI_PERIOD    = 14;
 const CANDLE_LIMIT  = 100;              // last 100 × 1h candles from Binance
 
 // Per-pair SL and display config
+// slPct: initial stop-loss distance from entry
+// trailFloor: minimum trail distance (SL never tightens below this)
+// atrTrigger / atrTighten: per-volatility-mode trail increment / tighten amount
 const PAIR_CFG = {
-  BTCUSDT: { slPct: 0.03, trailFloor: 0.01, dec: 2, label: 'BTC/USDT' },
-  ETHUSDT: { slPct: 0.03, trailFloor: 0.01, dec: 2, label: 'ETH/USDT' },
+  BTCUSDT: { slPct: 0.05, trailFloor: 0.01, dec: 2, label: 'BTC/USDT' },
+  ETHUSDT: { slPct: 0.05, trailFloor: 0.01, dec: 2, label: 'ETH/USDT' },
   SOLUSDT: { slPct: 0.05, trailFloor: 0.015, dec: 4, label: 'SOL/USDT' },
 };
+
+// ATR-adaptive trailing modes — bot selects mode based on current ATR vs 14-period avg
+// Slow market  : tighten aggressively (small trigger, large tighten → lock gains fast)
+// Normal market: balanced
+// Fast market  : give price room to breathe (large trigger, modest tighten)
+const TRAIL_MODES = {
+  slow:   { trigger: 0.01, tighten: 0.005, label: '🐢 Slow'   },  // +1% ATH → −0.5% trail
+  normal: { trigger: 0.02, tighten: 0.008, label: '🚶 Normal'  },  // +2% ATH → −0.8% trail
+  fast:   { trigger: 0.04, tighten: 0.013, label: '🚀 Fast'    },  // +4% ATH → −1.3% trail
+};
+const ATR_PERIOD = 14;  // candles for ATR calculation
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
 let db;
@@ -141,6 +155,53 @@ function computeRSI(candles, period = RSI_PERIOD) {
   return 100 - 100 / (1 + avgG / avgL);
 }
 
+// ATR (Average True Range) — measures daily volatility
+function computeATR(candles, period = ATR_PERIOD) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close;
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - prev),
+      Math.abs(candles[i].low  - prev)
+    ));
+  }
+  // Current ATR = simple average of last `period` TRs
+  const recent = trs.slice(-period);
+  const curATR = recent.reduce((s, v) => s + v, 0) / period;
+  // Historical avg ATR = average of all TRs
+  const avgATR = trs.reduce((s, v) => s + v, 0) / trs.length;
+  return { curATR, avgATR, ratio: curATR / avgATR };
+}
+
+// Determine trailing mode based on ATR ratio
+function getTrailMode(atrResult) {
+  if (!atrResult) return TRAIL_MODES.normal;
+  const { ratio } = atrResult;
+  if (ratio < 0.75) return TRAIL_MODES.slow;
+  if (ratio > 1.50) return TRAIL_MODES.fast;
+  return TRAIL_MODES.normal;
+}
+
+// RSI direction — was RSI below 40 recently, and is it now rising?
+// Checks the last `lookback` candles for a dip below 40 followed by a rise
+function checkRsiRecovery(candles, period = RSI_PERIOD, lookback = 5) {
+  if (candles.length < period + lookback + 2) return false;
+  // Compute RSI for each of the last `lookback+1` candles
+  const rsiSeries = [];
+  for (let offset = lookback; offset >= 0; offset--) {
+    const slice = candles.slice(0, candles.length - offset);
+    rsiSeries.push(computeRSI(slice, period));
+  }
+  // Check: any reading below 40 in the window, and current RSI > previous RSI
+  const hadDip    = rsiSeries.slice(0, -1).some(r => r !== null && r < 40);
+  const curRSI    = rsiSeries[rsiSeries.length - 1];
+  const prevRSI   = rsiSeries[rsiSeries.length - 2];
+  const isRising  = curRSI !== null && prevRSI !== null && curRSI > prevRSI;
+  return hadDip && isRising;
+}
+
 // Swing point detection — ported from Bot 1 (MemeScan Tracker)
 // lookback=3 gives cleaner signals on 1h candles than lookback=2
 function detectSwingPoints(candles, lookback = 3) {
@@ -160,30 +221,36 @@ function detectSwingPoints(candles, lookback = 3) {
   return { lows, highs };
 }
 
+// Bot chat deep link — added to every entry and SL alert so user can tap to open
+const BOT_CHAT_LINK = 'https://t.me/StableScanBot_bot';
+
 // ══════════════════════════════════════════════════════════════════════════════
-// ENTRY SIGNAL — Strategy B+C
+// ENTRY SIGNAL — Strategy B+C  (5 gates)
 //
-// Gate 1: Price above 50 EMA  (macro uptrend confirmed)
+// Gate 1: Price above 50 EMA         (macro uptrend confirmed)
 // Gate 2: Higher highs + higher lows  (swing structure intact)
-// Gate 3: Price in lower 75% of last swing range  (pullback, not at peak)
-// Gate 4: RSI not overbought  (< 70)
+// Gate 3: Price in 25–50% of swing range (deep pullback, near the floor)
+// Gate 4: RSI dipped below 40 recently AND now rising (momentum turning up)
+// Gate 5: Last closed candle is green  (price action confirmation)
 // ══════════════════════════════════════════════════════════════════════════════
 async function scanPair(symbol) {
   const candles = await fetchCandles(symbol, '1h', CANDLE_LIMIT);
   if (candles.length < EMA_PERIOD + 10) return null;
 
-  const price = candles[candles.length - 1].close;
-  const ema50 = computeEMA(candles, EMA_PERIOD);
-  const rsi   = computeRSI(candles, RSI_PERIOD);
+  const price     = candles[candles.length - 1].close;
+  const ema50     = computeEMA(candles, EMA_PERIOD);
+  const rsi       = computeRSI(candles, RSI_PERIOD);
+  const lastCandle = candles[candles.length - 1];
+  const atrResult = computeATR(candles, ATR_PERIOD);
   const { lows, highs } = detectSwingPoints(candles, 3);
 
-  // Gate 1: trend
+  // Gate 1: price above 50 EMA — uptrend confirmed
   if (!ema50 || price < ema50) {
     console.log(`[SCAN] ${symbol} — below 50 EMA ($${fp(price,symbol)} < $${fp(ema50,symbol)})`);
     return null;
   }
 
-  // Gate 2: swing structure
+  // Gate 2: higher highs + higher lows swing structure
   if (highs.length < 2 || lows.length < 2) {
     console.log(`[SCAN] ${symbol} — not enough swing points (${highs.length}H ${lows.length}L)`);
     return null;
@@ -202,11 +269,15 @@ async function scanPair(symbol) {
     return null;
   }
 
-  // Gate 3: pullback — not chasing the top
+  // Gate 3: price in 25–50% of swing range (deep pullback, near the floor)
   const swingRange = lastHigh - lastLow;
   const rangePos   = swingRange > 0 ? (price - lastLow) / swingRange : 1;
-  if (rangePos > 0.75) {
-    console.log(`[SCAN] ${symbol} — price at ${(rangePos*100).toFixed(0)}% of range, too high — wait`);
+  if (rangePos > 0.50) {
+    console.log(`[SCAN] ${symbol} — price at ${(rangePos*100).toFixed(0)}% of range, above 50% — too high`);
+    return null;
+  }
+  if (rangePos < 0.25) {
+    console.log(`[SCAN] ${symbol} — price at ${(rangePos*100).toFixed(0)}% of range, below 25% — structure may be breaking`);
     return null;
   }
   if (price < lastLow * 1.002) {
@@ -214,43 +285,58 @@ async function scanPair(symbol) {
     return null;
   }
 
-  // Gate 4: RSI
-  if (rsi !== null && rsi > 70) {
-    console.log(`[SCAN] ${symbol} — RSI ${rsi.toFixed(1)} overbought`);
+  // Gate 4: RSI recovery — dipped below 40 within last 5 candles, now rising
+  const rsiRecovered = checkRsiRecovery(candles, RSI_PERIOD, 5);
+  if (!rsiRecovered) {
+    console.log(`[SCAN] ${symbol} — RSI not recovering from oversold (RSI=${rsi?.toFixed(1)})`);
     return null;
   }
 
-  console.log(`[SIGNAL] ✅ ${symbol} price=$${fp(price,symbol)} ema50=$${fp(ema50,symbol)} RSI=${rsi?.toFixed(1)} range=${(rangePos*100).toFixed(0)}% HH=✅ HL=✅`);
-  return { symbol, price, ema50, rsi, lastHigh, lastLow, prevHigh, prevLow, rangePos };
+  // Gate 5: last closed candle is green (bullish close)
+  const isGreenCandle = lastCandle.close > lastCandle.open;
+  if (!isGreenCandle) {
+    console.log(`[SCAN] ${symbol} — last candle is red (open=${fp(lastCandle.open,symbol)} close=${fp(lastCandle.close,symbol)})`);
+    return null;
+  }
+
+  const trailMode = getTrailMode(atrResult);
+  console.log(`[SIGNAL] ✅ ${symbol} price=$${fp(price,symbol)} ema50=$${fp(ema50,symbol)} RSI=${rsi?.toFixed(1)} range=${(rangePos*100).toFixed(0)}% RSI✅ Green✅ Trail:${trailMode.label}`);
+  return { symbol, price, ema50, rsi, lastHigh, lastLow, prevHigh, prevLow, rangePos, trailMode, atrResult };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ENTER POSITION
 // ══════════════════════════════════════════════════════════════════════════════
 async function enterPosition(signal) {
-  const { symbol, price, lastHigh, lastLow } = signal;
+  const { symbol, price, lastHigh, lastLow, trailMode } = signal;
   const cfg    = PAIR_CFG[symbol];
-  const slPrc  = price * (1 - cfg.slPct);
+  const slPrc  = price * (1 - cfg.slPct);   // 5% initial SL
   const size   = POSITION_SIZE;
   const qty    = size / price;
 
   const pos = {
     symbol,
-    pair:        cfg.label,
-    entryPrice:  price,
-    currentSL:   slPrc,
-    peakPrice:   price,
+    pair:          cfg.label,
+    entryPrice:    price,
+    currentSL:     slPrc,
+    peakPrice:     price,
     size,
     qty,
-    slPct:       cfg.slPct,
-    trailFloor:  cfg.trailFloor,
+    slPct:         cfg.slPct,
+    trailFloor:    cfg.trailFloor,
+    // Current ATR-adaptive trail mode (rechecked every monitor cycle)
+    trailTrigger:  trailMode.trigger,
+    trailTighten:  trailMode.tighten,
+    trailLabel:    trailMode.label,
+    // Track ATH steps for the trail ratchet
+    lastTrailATH:  price,
     lastHigh,
     lastLow,
-    entryTime:   Date.now(),
+    entryTime:     Date.now(),
     paperMode,
-    pnl:         0,
-    lhTightened: false,
-    lhPrevPeak:  null,
+    pnl:           0,
+    lhTightened:   false,
+    lhPrevPeak:    null,
   };
 
   try {
@@ -272,7 +358,9 @@ async function enterPosition(signal) {
     `Size:   $${size.toFixed(2)}  (${qty.toFixed(6)} ${symbol.replace('USDT','')})\n` +
     `SL:     $${fp(slPrc, symbol)}  (−${(cfg.slPct*100).toFixed(1)}%)\n` +
     `Range:  $${fp(lastLow,symbol)} – $${fp(lastHigh,symbol)}\n` +
-    `50 EMA: $${fp(signal.ema50, symbol)}`
+    `50 EMA: $${fp(signal.ema50, symbol)}\n` +
+    `Trail:  ${trailMode.label}\n\n` +
+    `[📱 Open bot chat](${BOT_CHAT_LINK})`
   );
   console.log(`[ENTER] ${symbol} @ $${fp(price,symbol)} SL=$${fp(slPrc,symbol)} $${size} ${paperMode?'PAPER':'LIVE'}`);
   return pos;
@@ -309,7 +397,8 @@ async function closePosition(pos, exitPrice, reason) {
     `${emoji} *${reason} — ${pos.pair}* ${mode}\n\n` +
     `Entry: $${fp(pos.entryPrice,pos.symbol)} → Exit: $${fp(exitPrice,pos.symbol)}\n` +
     `P&L:   *${pnlStr}* (${pct(pnlPct)})\n` +
-    `Hold:  ${dur(holdMs)}`
+    `Hold:  ${dur(holdMs)}\n\n` +
+    `[📱 Open bot chat](${BOT_CHAT_LINK})`
   );
   console.log(`[CLOSE] ${pos.symbol} ${reason} @ $${fp(exitPrice,pos.symbol)} PnL=${pnlStr} hold=${dur(holdMs)}`);
 }
@@ -371,23 +460,52 @@ async function monitorPositions() {
               `⚠️ *LOWER-HIGH — ${pos.pair}*\n` +
               `Swing: $${fp(lastH,pos.symbol)} < prev $${fp(prevH,pos.symbol)}\n` +
               `SL tightened → $${fp(tightSL,pos.symbol)} (−${(pos.trailFloor*100).toFixed(1)}%)\n` +
-              `Will release when price > $${fp(prevH,pos.symbol)}`
+              `Will release when price > $${fp(prevH,pos.symbol)}\n\n` +
+              `[📱 Open bot chat](${BOT_CHAT_LINK})`
             ).catch(() => {});
           }
         }
       }
     } catch(e) { /* candle fetch non-critical */ }
 
-    // ── TRAILING SL (ratchet, only moves up) ────────────────────────────────
+    // ── ATR-ADAPTIVE TRAILING SL (ratchet, only moves up) ───────────────────
     if (!pos.lhTightened) {
-      const gainPct  = (pos.peakPrice - pos.entryPrice) / pos.entryPrice;
-      // Every +10% ATH gain, trail tightens by 0.5% (floors at trailFloor)
-      const steps    = Math.floor(gainPct * 100 / 10);
-      const trailPct = Math.max(pos.trailFloor, pos.slPct - steps * 0.005);
-      const newSL    = pos.peakPrice * (1 - trailPct);
-      if (newSL > pos.currentSL * 1.002) {
-        updates.currentSL = newSL;
-        pos.currentSL     = newSL;
+      // Recalculate ATR mode in case market conditions changed
+      try {
+        const freshCandles = await fetchCandles(pos.symbol, '1h', 50);
+        const freshATR     = computeATR(freshCandles, ATR_PERIOD);
+        const mode         = getTrailMode(freshATR);
+        if (mode.label !== pos.trailLabel) {
+          // Volatility regime changed — update mode
+          updates.trailTrigger = mode.trigger;
+          updates.trailTighten = mode.tighten;
+          updates.trailLabel   = mode.label;
+          pos.trailTrigger     = mode.trigger;
+          pos.trailTighten     = mode.tighten;
+          pos.trailLabel       = mode.label;
+          sendTelegram(
+            `⚙️ *TRAIL MODE CHANGE — ${pos.pair}*\n` +
+            `Market volatility shifted → ${mode.label}\n` +
+            `Trigger: +${(mode.trigger*100).toFixed(0)}% ATH → tighten ${(mode.tighten*100).toFixed(1)}%`
+          ).catch(() => {});
+        }
+      } catch(e) { /* non-critical — keep existing mode */ }
+
+      // Fine-grained ratchet: every time price sets a new ATH by >= trigger %,
+      // tighten the trail by tighten %, floor at trailFloor
+      const triggerPrice = (pos.lastTrailATH || pos.entryPrice) * (1 + pos.trailTrigger);
+      if (pos.peakPrice >= triggerPrice) {
+        // Calculate how many trigger steps have been hit since entry
+        const totalGain = (pos.peakPrice - pos.entryPrice) / pos.entryPrice;
+        const steps     = Math.floor(totalGain / pos.trailTrigger);
+        const trailPct  = Math.max(pos.trailFloor, pos.slPct - steps * pos.trailTighten);
+        const newSL     = pos.peakPrice * (1 - trailPct);
+        if (newSL > pos.currentSL * 1.001) {
+          updates.currentSL    = newSL;
+          updates.lastTrailATH = pos.peakPrice;
+          pos.currentSL        = newSL;
+          pos.lastTrailATH     = pos.peakPrice;
+        }
       }
     }
 

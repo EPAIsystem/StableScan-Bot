@@ -573,7 +573,8 @@ async function generateReport() {
     `Net P&L:  *${net>=0?'+':''}$${net.toFixed(2)}*\n` +
     `Avg hold: ${avgHold} min\n\n` +
     `*By pair:*\n${pairLines}\n\n` +
-    `Mode: ${trades.some(t=>!t.paperMode) ? '💰 includes live trades' : '📄 paper only'}`
+    `Mode: ${trades.some(t=>!t.paperMode) ? '💰 includes live trades' : '📄 paper only'}\n\n` +
+    `[📱 Open bot chat](${BOT_CHAT_LINK})`
   );
 }
 
@@ -596,14 +597,15 @@ async function handleCommand(text) {
       `Mode:      ${paperMode ? '📄 Paper' : '💰 Live'}\n` +
       `Pairs:     BTC · ETH · SOL\n` +
       `Positions: ${positions.length}/${MAX_POSITIONS}\n` +
-      `Strategy:  50 EMA + Swing pullback`
+      `Strategy:  50 EMA + Swing pullback\n\n` +
+      `[📱 Open bot chat](${BOT_CHAT_LINK})`
     );
   }
 
   // ── /b2status ─────────────────────────────────────────────────────────────
   if (cmd === '/b2status') {
     if (positions.length === 0)
-      return sendTelegram(`📊 *StableScan Status*\n\nNo open positions.\nNext scan: every 15 min.`);
+      return sendTelegram(`📊 *StableScan Status*\n\nNo open positions.\nNext scan: every 15 min.\n\n[📱 Open bot chat](${BOT_CHAT_LINK})`);
 
     const lines = await Promise.all(positions.map(async pos => {
       let cur = pos.entryPrice;
@@ -616,10 +618,15 @@ async function handleCommand(text) {
         `  P&L:   ${pnl>=0?'+':''}$${pnl.toFixed(2)}\n` +
         `  SL:    $${fp(pos.currentSL,pos.symbol)}` +
         (pos.lhTightened ? '  ⚠️ _tightened_' : '') + '\n' +
+        `  Trail: ${pos.trailLabel || '—'}\n` +
         `  Hold:  ${dur(Date.now()-pos.entryTime)}`
       );
     }));
-    return sendTelegram(`📊 *Open Positions (${positions.length})*\n\n${lines.join('\n\n')}`);
+    return sendTelegram(
+      `📊 *Open Positions (${positions.length})*\n\n` +
+      lines.join('\n\n') +
+      `\n\n[📱 Open bot chat](${BOT_CHAT_LINK})`
+    );
   }
 
   // ── /b2report ─────────────────────────────────────────────────────────────

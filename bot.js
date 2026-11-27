@@ -155,6 +155,37 @@ function computeRSI(candles, period = RSI_PERIOD) {
   return 100 - 100 / (1 + avgG / avgL);
 }
 
+// MACD — detects momentum fade before price reversal
+// Returns { declining: bool } — true when MACD line fell for 2 consecutive candles
+// A declining MACD while price is still high = momentum exhaustion signal
+function computeMACD(candles, fast = 12, slow = 26) {
+  if (candles.length < slow + 3) return null;
+  const closes = candles.map(c => c.close);
+
+  function emaSeq(data, period) {
+    const k = 2 / (period + 1);
+    let val = data.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    const out = [];
+    for (let i = period; i < data.length; i++) {
+      val = data[i] * k + val * (1 - k);
+      out.push(val);
+    }
+    return out;
+  }
+
+  const ema12 = emaSeq(closes, fast);
+  const ema26 = emaSeq(closes, slow);
+  // Align: ema12 is longer by (slow - fast) values; trim to ema26 length
+  const trim  = ema12.length - ema26.length;
+  const macdLine = ema26.map((v, i) => ema12[i + trim] - v);
+  if (macdLine.length < 3) return null;
+
+  const h0 = macdLine[macdLine.length - 1];
+  const h1 = macdLine[macdLine.length - 2];
+  const h2 = macdLine[macdLine.length - 3];
+  return { declining: h0 < h1 && h1 < h2, current: h0 };
+}
+
 // ATR (Average True Range) — measures daily volatility
 function computeATR(candles, period = ATR_PERIOD) {
   if (candles.length < period + 1) return null;
@@ -429,6 +460,43 @@ async function monitorPositions() {
       continue;
     }
 
+    // ── MOMENTUM EXHAUSTION EXIT ─────────────────────────────────────────────
+    // Fires only when SL gap > 10% (significant profit at risk).
+    // Needs 2-of-3: RSI overbought+declining, MACD fading, 2 consecutive red candles.
+    // Protects against giving back large gains to a trailing SL.
+    const slGapPct = (price - pos.currentSL) / price * 100;
+    if (slGapPct > 10) {
+      try {
+        const exCandles = await fetchCandles(pos.symbol, '1h', 60);
+
+        // Signal 1: RSI overheating AND already turning down
+        const rsiNow  = computeRSI(exCandles);
+        const rsiPrev = computeRSI(exCandles.slice(0, -2));
+        const sigRSI  = rsiNow !== null && rsiPrev !== null &&
+                        rsiNow > 65 && rsiNow < rsiPrev;
+
+        // Signal 2: MACD line declining 2 consecutive candle periods (momentum fading)
+        const macd    = computeMACD(exCandles);
+        const sigMACD = macd !== null && macd.declining;
+
+        // Signal 3: 2 consecutive bearish candles — trend dying, not healthy pullback
+        const c1 = exCandles[exCandles.length - 1];
+        const c2 = exCandles[exCandles.length - 2];
+        const sigCandle = c1.close < c1.open && c2.close < c2.open;
+
+        const firedCount = [sigRSI, sigMACD, sigCandle].filter(Boolean).length;
+        if (firedCount >= 2) {
+          const labels = [];
+          if (sigRSI)    labels.push(`RSI ${rsiNow.toFixed(0)} declining`);
+          if (sigMACD)   labels.push('MACD fade');
+          if (sigCandle) labels.push('2 red candles');
+          console.log(`[EXHAUST] ${pos.symbol} gap=${slGapPct.toFixed(1)}% signals: ${labels.join(', ')}`);
+          await closePosition(pos, price, `📉 Momentum exhaustion (${labels.join(' + ')})`);
+          continue;
+        }
+      } catch(e) { /* non-critical — exhaustion check skipped on error */ }
+    }
+
     // ── LOWER-HIGH TIGHTENING (same logic as Bot 1) ──────────────────────────
     try {
       const candles = await fetchCandles(pos.symbol, '1h', 50);
@@ -616,8 +684,8 @@ async function handleCommand(text) {
         `*${pos.pair}*\n` +
         `  Price: $${fp(cur,pos.symbol)}  (${pct(pp)})\n` +
         `  P&L:   ${pnl>=0?'+':''}$${pnl.toFixed(2)}\n` +
-        `  SL:    $${fp(pos.currentSL,pos.symbol)}` +
-        (pos.lhTightened ? '  ⚠️ _tightened_' : '') + '\n' +
+        `  SL:    $${fp(pos.currentSL,pos.symbol)}  ` +
+        (pos.lhTightened ? '⚠️ _floor lock_' : '✅ _trailing_') + '\n' +
         `  Trail: ${pos.trailLabel || '—'}\n` +
         `  Hold:  ${dur(Date.now()-pos.entryTime)}`
       );
